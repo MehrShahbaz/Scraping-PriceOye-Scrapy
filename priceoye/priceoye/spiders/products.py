@@ -1,6 +1,5 @@
 import scrapy
-import json
-import re
+from json import loads
 
 
 class ProductsSpider(scrapy.Spider):
@@ -18,78 +17,132 @@ class ProductsSpider(scrapy.Spider):
             if link.css("::text").get() not in self.avoid_text:
                 href = link.css("::attr(href)").get()
                 if href:
-                    yield response.follow(href, self.parse_category)
+                    yield response.follow(
+                        href, self.parse_category, meta={"trail": [response.url]}
+                    )
 
     def parse_category(self, response):
         """Parse subcategory pages and follow links to product pages."""
+        trail = response.meta.get("trail", [])
         for url in response.css(".productBox a::attr(href)").getall():
-            yield response.follow(url, self.parse_product)
+            yield response.follow(
+                url, self.parse_product, meta={"trail": trail + [response.url]}
+            )
 
         next_page = response.css('.pagination a[rel="next"]::attr(href)').get()
         if next_page:
-            yield response.follow(next_page, self.parse_category)
+            yield response.follow(next_page, self.parse_category, meta={"trail": trail})
 
     def parse_product(self, response):
         """Parse product details from the product page."""
-        json_data = self.extract_ld_json(response)
+        script = response.css('script:contains("product_data")').get()
+        product_data = None
 
-        if not json_data:
+        if not script:
             return
 
-        offers = json_data.get("offers", {})
-        aggregate_rating = json_data.get("aggregateRating", {})
-        previous_price = self.extract_previous_price(response)
+        formated_script = script.split(" = ")[-1]
+        formated_script = formated_script.split("</script>")[0]
 
-        yield {
-            "product_name": json_data.get("name", ""),
-            "brand_name": json_data.get("brand", ""),
-            "price": int(offers.get("price", 0)),
-            "previous_price": previous_price,
-            "currency": offers.get("priceCurrency"),
-            "images": self.extract_images(response),
-            "in_stock": self.is_in_stock(response),
-            "rating": float(aggregate_rating.get("ratingValue", 0.0)),
-            "rating_count": int(aggregate_rating.get("ratingCount", 0)),
-            "colors": response.css(".color-name span::text").getall(),
-            "product_url": json_data.get("url", ""),
+        if not formated_script:
+            return
+
+        data = loads(formated_script)
+        product_data = data.get("dataSet")
+
+        if not product_data:
+            return
+
+        product = {
+            "product_name": product_data["title"],
+            "brand_name": product_data["brand_name"],
+            "category": product_data["category_name"],
+            "url": response.url,
+            "trail": response.meta.get("trail", []),
         }
 
-    def extract_ld_json(self, response):
-        """Extract and sanitize JSON data from LD+JSON script tags."""
-        ld_json_scripts = response.css('script[type="application/ld+json"]').getall()
+        product_variants = data.get("product_config").get("dataPrices")
+        rating = product.get("ratings_data")
+        if product_variants:
+            image_urls = self.get_colors_dict(data)
+            formated_data = self.get_data(product_variants)
 
-        if len(ld_json_scripts) > 2:
-            json_string = ld_json_scripts[2].strip()
-            sanitized_json_string = json_string.replace("\n", " ").replace("\r", " ")
-            sanitized_json_string = re.sub(
-                r"[\x00-\x1f\x7f]", "", sanitized_json_string
+            product["variants"] = self.format_data(
+                formated_data, image_urls, self.get_product_images(product_data)
             )
 
-            sanitized_json_string = re.search(
-                r"(?<=>)\s*(.*?)\s*(?=<)", sanitized_json_string, re.DOTALL
-            ).group(1)
+        else:
+            product["variants"] = [
+                {
+                    "color": None,
+                    "images": self.get_product_images(product_data),
+                    "size": None,
+                    "price": product_data["expected_price"],
+                    "prev_price": None,
+                    "store_name": None,
+                    "quantity": None,
+                    "in_stock": False,
+                }
+            ]
 
-            try:
-                return json.loads(sanitized_json_string)
-            except json.JSONDecodeError:
-                self.logger.error("Failed to decode JSON")
-                return {}
-        return {}
+        yield product
 
-    def extract_previous_price(self, response):
-        """Extract the previous price from the product page."""
-        previous_price = (
-            response.css(".stock-info::text").get(default="0").strip().replace(",", "")
-        )
-        return int(previous_price) if previous_price.isdigit() else None
+    def get_colors_dict(self, data):
+        image_dict = data.get("product_color_images")
 
-    def extract_images(self, response):
-        """Extract product images from the product page."""
-        images = response.css(".product-image-thumbnail img::attr(src)").getall()
-        if not images:
-            images = response.css("#product-image-main img::attr(src)").getall()
-        return images
+        if not image_dict:
+            return None
 
-    def is_in_stock(self, response):
-        """Check if the product is in stock."""
-        return response.css(".stock-status::text").get() == "In Stock"
+        for color, images in image_dict.items():
+            image_dict[color] = [
+                "https://images.priceoye.pk/" + image for image in images
+            ]
+        return image_dict
+
+    def get_data(self, data):
+        data1 = list(data.values())
+        formated_data = []
+
+        if isinstance(data1[0], dict):
+            for x in data1:
+                data2 = list(x.values())
+                data3 = [y for y in data2]
+                formated_data.extend([d for sublist in data3 for d in sublist])
+
+        elif isinstance(data1[0], list):
+            return [
+                dictionary
+                for sublist1 in data1
+                for sublist2 in sublist1
+                for dictionary in sublist2
+            ]
+        else:
+            return []
+
+        return formated_data
+
+    def format_data(self, data: list, colors, images):
+        return [
+            {
+                "color": self.format_color(x["product_color"]),
+                "images": colors.get(x["product_color"]) if colors else images,
+                "size": x["product_size"],
+                "price": self.format_price(x["product_price"]),
+                "prev_price": self.format_price(x["retail_price"]),
+                "store_name": x["store_name"],
+                "in_stock": (
+                    True if x["product_availability"].lower() == "in stock" else False
+                ),
+            }
+            for x in data
+        ]
+
+    def format_price(self, price: str) -> int:
+        if price:
+            return int(price.replace(",", ""))
+
+    def format_color(self, color: str) -> str:
+        return color.replace("_", " ").title()
+
+    def get_product_images(self, data):
+        return data.get("api_image", [])
